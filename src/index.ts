@@ -1,7 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "fs-extra";
-import { chromium } from "playwright";
+import { Browser, BrowserContext, chromium } from "playwright";
+import { exec } from "child_process";
+import { promisify } from "util";
 
 import { startServer, stopServer } from "./server.js";
 import type { ServerControl } from "./server.js";
@@ -9,13 +11,12 @@ import type { ServerControl } from "./server.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Promisify exec for easier async/await usage
+const execAsync = promisify(exec);
+
 // --- Configuration ---
 const SERVER_PORT = 8080;
-const userDataDir = path.join(
-  __dirname,
-  "browser-data",
-  "profile-" + Date.now()
-);
+const userDataDir = path.join(__dirname, "browser-data", "persistent-profile");
 const htmlFilePath = path.join(__dirname, "test.html");
 const htmlFileUrl = `http://localhost:${SERVER_PORT}/`;
 const testCookie = {
@@ -26,29 +27,17 @@ const testCookie = {
 };
 // --- End Configuration ---
 
-async function runTest(
+async function runTestStep(
   headlessMode: boolean,
   step: number,
   setCookie: boolean
-) {
+): Promise<boolean> {
   console.log(`\n--- Running Step ${step} (Headless: ${headlessMode}) ---`);
   console.log(`Using userDataDir: ${userDataDir}`);
 
-  // --- Workaround attempt: Delete lock file before launch ---
-  // const lockfilePath = path.join(userDataDir, "SingletonLock");
-  // console.log(
-  //   `[Workaround] Attempting to remove lock file (if it exists): ${lockfilePath}`
-  // );
-  // try {
-  //   await fs.remove(lockfilePath); // Directly attempt removal
-  //   console.log(`[Workaround] Finished removal attempt.`);
-  // } catch (err) {
-  //   console.warn(`[Workaround] Error during fs.remove: ${err}`);
-  // }
-  // --- End Workaround ---
-
-  let browserContext = null;
+  let browserContext: BrowserContext | null = null;
   let success = true;
+
   try {
     browserContext = await chromium.launchPersistentContext(userDataDir, {
       headless: headlessMode,
@@ -77,83 +66,238 @@ async function runTest(
         console.log(
           `!!! FAILURE: Did not find cookie '${testCookie.name}' !!!`
         );
-        if (headlessMode) {
-          console.log("(This is expected failure in Step 2 due to the bug)");
-        }
+        success = false;
       }
     }
 
-    // For headful step 1, wait for manual close after setting cookie
+    // For headful step 1, wait for manual close, then attempt graceful close
     if (setCookie && !headlessMode) {
       console.log(
         ">>> Cookie Set. Please close the browser window manually to continue. <<<"
       );
-      await new Promise<void>((resolve) => (page as any).on("close", resolve));
+      await new Promise<void>((resolve) =>
+        (page as any).once("close", resolve)
+      );
       console.log("Browser window closed by user.");
-      // Explicitly return true as context is closed by user action here
-      return true;
-    }
 
-    console.log("Closing context cleanly...");
-    await browserContext.close();
-    console.log("Context closed.");
+      if (browserContext && browserContext.close) {
+        console.log(
+          "Attempting graceful context close (might not terminate process)..."
+        );
+        try {
+          await browserContext.close();
+        } catch (e: any) {
+          console.warn(`Graceful context close failed: ${e.message}`);
+        }
+        browserContext = null;
+      }
+    } else {
+      // For Steps 2 & 3, close context normally.
+      console.log("Closing context cleanly for this step...");
+      await browserContext.close();
+      console.log("Context closed.");
+      browserContext = null;
+    }
   } catch (error: any) {
-    console.error(
-      `Error during test (Step ${step}, Headless: ${headlessMode}):`,
-      error
-    );
-    success = false; // Mark as failed
-    if (browserContext) {
-      console.log("Attempting force close due to error...");
-      // context.close() might fail again if already in a bad state
+    if (
+      error.message?.includes("Target closed") ||
+      error.message?.includes("browser has been closed") ||
+      error.message?.includes("BrowserContext has been closed")
+    ) {
+      console.warn(
+        `Ignoring error during step execution, likely due to intended closure: ${error.message}`
+      );
+    } else {
+      console.error(
+        `Error during test (Step ${step}, Headless: ${headlessMode}):`,
+        error
+      );
+      success = false;
+    }
+  } finally {
+    if (browserContext && browserContext.close) {
       try {
         await browserContext.close();
       } catch {
-        /* Ignore secondary close errors */
+        /* Ignore */
       }
     }
   }
-  // Return false if we got here without explicitly returning true (e.g. Step 1 success)
-  // or if an error occurred.
-  return success && !setCookie;
+  return success;
 }
 
 (async () => {
   let serverControl: ServerControl | null = null;
+  process.exitCode = 0;
+  let foundPid: number | null = null; // Variable to store PID found via CLI
 
   try {
-    // Ensure the base directory exists
     await fs.ensureDir(path.dirname(userDataDir));
+    console.log("Ensuring clean profile directory before Step 1...");
+    await fs.remove(userDataDir);
+    await fs.ensureDir(userDataDir);
 
-    // Start the HTTP server using the imported function
     serverControl = await startServer(htmlFilePath, SERVER_PORT);
 
-    // Step 1: Run headful to create profile and set cookie
-    console.log("Step 1: Initial headful run to set cookie...");
-    const step1Success = await runTest(false, 1, true);
-    if (!step1Success) {
-      console.error(
-        "Step 1 did not complete successfully (User may not have closed window). Aborting."
-      );
-      return; // Don't proceed if Step 1 didn't finish right
+    console.log("Executing Step 1: Initial headful run to set cookie...");
+    await runTestStep(false, 1, true);
+
+    // --- Find PID using CLI command ---
+    console.log(`\nAttempting to find PID for userDataDir: ${userDataDir}...`);
+    let findPidCommand = "";
+    if (process.platform === "win32") {
+      // Escape backslashes for wmic query
+      const escapedUserDataDir = userDataDir.replace(/\\/g, "\\\\");
+      findPidCommand = `wmic process where "commandline like '%--user-data-dir=${escapedUserDataDir}%'" get processid /value`;
+    } else {
+      // Use pgrep -f for macOS/Linux
+      // Ensure the path is quoted properly in case it contains spaces or special characters
+      findPidCommand = `pgrep -f -- "--user-data-dir=${userDataDir}"`;
     }
 
-    // Step 2: Run headless using the *same* profile, try reading cookie
-    console.log("\nStep 2: Testing headless read with existing profile...");
-    await runTest(true, 2, false);
-
-    // Step 3: Run headful again to check launch and read cookie
-    console.log("\nStep 3: Testing headful read again + launch check...");
-    await runTest(false, 3, false);
-  } finally {
-    console.log("\nTest finished. Cleaning up.");
     try {
-      await stopServer(serverControl);
-      // await fs.remove(userDataDir);
-      // console.log(`Removed profile dir: ${userDataDir}`);
-      process.exit(0);
-    } catch (err) {
-      console.error("Error during cleanup:", err);
+      console.log(`Executing find PID command: ${findPidCommand}`);
+      const { stdout } = await execAsync(findPidCommand);
+      const output = stdout.trim();
+      console.log(`Find PID command output: ${output || "(no output)"}`);
+
+      if (output) {
+        if (process.platform === "win32") {
+          // Parse wmic output like "ProcessId=1234"
+          const match = output.match(/ProcessId=(\d+)/);
+          if (match && match[1]) {
+            foundPid = parseInt(match[1], 10);
+          }
+        } else {
+          // pgrep output is usually just the PID(s), take the first one
+          const pids = output
+            .split("\n")
+            .map((pid) => parseInt(pid.trim(), 10))
+            .filter((pid) => !isNaN(pid));
+          if (pids.length > 0) {
+            foundPid = pids[0]; // Take the first PID if multiple are found (unlikely for unique path)
+            if (pids.length > 1) {
+              console.warn(
+                `Found multiple PIDs (${pids.join(
+                  ", "
+                )}) matching the userDataDir, using the first: ${foundPid}`
+              );
+            }
+          }
+        }
+      }
+
+      if (foundPid) {
+        console.log(`Found lingering process PID via CLI: ${foundPid}`);
+      } else {
+        console.log(
+          "Could not find lingering process PID via CLI (process might have exited or command failed)."
+        );
+      }
+    } catch (findPidError: any) {
+      // pgrep/wmic might error if no process is found, treat this as non-fatal
+      // Check standard error as well for messages like "No such process"
+      const errorOutput =
+        findPidError.stderr?.toLowerCase() ||
+        findPidError.message?.toLowerCase() ||
+        "";
+      const noProcessFound =
+        errorOutput.includes("no such process") || findPidError.code === 1; // pgrep returns 1 if no match
+
+      if (noProcessFound) {
+        console.log("Command to find PID indicated no matching process.");
+      } else {
+        console.warn(
+          `Command to find PID failed: ${findPidError.message} (Code: ${findPidError.code})`
+        );
+        console.warn(`Stderr: ${findPidError.stderr || "(no stderr)"}`);
+      }
+      foundPid = null; // Ensure PID is null if command fails or finds nothing
     }
+    // --- End Find PID ---
+
+    // --- Force Kill Step 1 Browser Process using found PID ---
+    if (foundPid) {
+      console.log(
+        `\nAttempting to forcefully kill process with found PID: ${foundPid}...`
+      );
+      const killCommand =
+        process.platform === "win32"
+          ? `taskkill /PID ${foundPid} /F`
+          : `kill -9 ${foundPid}`;
+
+      try {
+        console.log(`Executing kill command: ${killCommand}`);
+        const { stdout: killStdout, stderr: killStderr } = await execAsync(
+          killCommand
+        );
+        console.log(`Kill command stdout: ${killStdout || "(no stdout)"}`);
+        console.log(`Kill command stderr: ${killStderr || "(no stderr)"}`);
+        console.log(`Forced kill attempt on PID ${foundPid} finished.`);
+      } catch (killError: any) {
+        // Check for errors indicating the process was already gone
+        const errorOutput =
+          killError.stderr?.toLowerCase() ||
+          killError.message?.toLowerCase() ||
+          "";
+        const alreadyGone =
+          errorOutput.includes("no such process") || // kill -9
+          (errorOutput.includes("process with pid") &&
+            errorOutput.includes("not found")); // taskkill
+
+        if (alreadyGone) {
+          console.log(
+            `Kill command indicated PID ${foundPid} was already gone.`
+          );
+        } else {
+          console.warn(
+            `Warning during kill command execution for PID ${foundPid}: ${killError.message} (Code: ${killError.code})`
+          );
+          console.warn(`Stderr: ${killError.stderr || "(no stderr)"}`);
+        }
+      }
+    } else {
+      console.warn("\nSkipping kill command: PID was not found via CLI.");
+    }
+    // --- End Force Kill ---
+
+    console.log("Waiting briefly after find/kill attempt...");
+    await new Promise((resolve) => setTimeout(resolve, 4000)); // delay
+
+    if (process.exitCode !== 0 && process.exitCode !== undefined) {
+      console.error(
+        "Step 1 encountered critical errors unrelated to closing. Aborting."
+      );
+      return;
+    }
+
+    console.log(
+      "\nExecuting Step 2: Testing headless read with existing profile..."
+    );
+    const step2Success = await runTestStep(true, 2, false);
+    if (!step2Success) {
+      console.error("Step 2 failed. Aborting subsequent steps.");
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(
+      "\nExecuting Step 3: Testing headful read again + launch check..."
+    );
+    const step3Success = await runTestStep(false, 3, false);
+    if (!step3Success) {
+      console.error("Step 3 failed.");
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log("\nAll steps completed successfully in the same Node process.");
+  } catch (error) {
+    console.error("Unhandled error in main execution:", error);
+    process.exitCode = 1;
+  } finally {
+    console.log("\nTest sequence finished. Cleaning up server.");
+    await stopServer(serverControl);
+    console.log(`Exiting with code: ${process.exitCode}`);
   }
 })();
